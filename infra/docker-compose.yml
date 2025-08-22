@@ -1,0 +1,84 @@
+
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: minio123
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ../minio_data:/data
+
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.9.2
+    container_name: mlflow
+    command: >
+      mlflow server
+      --backend-store-uri sqlite:///mlflow.db
+      --default-artifact-root s3://mlflow/
+      --host 0.0.0.0
+      --port 5000
+    environment:
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio123
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    ports:
+      - "5000:5000"
+    depends_on:
+      - minio
+    volumes:
+      - ../mlruns:/mlruns
+      - ../mlflow_data:/app  # optional: where mlflow.db will live
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+
+  trainer:
+    build:
+      context: ../services/trainer
+      dockerfile: Dockerfile
+    container_name: trainer
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - AWS_ACCESS_KEY_ID=minio
+      - AWS_SECRET_ACCESS_KEY=minio123
+      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
+      - ARTIFACTS_DIR=/app_artifacts
+    volumes:
+      - ../artifacts:/app_artifacts
+    command: ["python", "train.py"]
+    depends_on:
+      - mlflow
+      - minio
+
+
+  model-server:
+    build:
+      context: ../services/model_server    # <<-- NOTE: context is relative to infra/
+      dockerfile: Dockerfile
+    container_name: model-server
+    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mlflow
+      - redis
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      AWS_ACCESS_KEY_ID: minio
+      AWS_SECRET_ACCESS_KEY: minio123
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      MODEL_NAME: ModelOpsStudioModel
+    volumes:
+      - ../artifacts:/app/artifacts
+      - ../services/model_server:/app  # mount code so edits reflect without rebuild (dev convenience)
+
+volumes:
+  minio_data:

@@ -1,2 +1,8 @@
 venv/
 .env
+minio_data/
+mlartifacts/
+mlruns/
+__pycache__/
+tmp_model/
+web/
