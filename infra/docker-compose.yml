@@ -1,17 +1,14 @@
-
 services:
   minio:
     image: minio/minio:latest
     container_name: minio
     command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: minio123
+    env_file: .env # Loads all variables from the .env file
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${MINIO_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - ../minio_data:/data
+      - minio_data:/data
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.9.2
@@ -19,38 +16,39 @@ services:
     command: >
       mlflow server
       --backend-store-uri sqlite:///mlflow.db
-      --default-artifact-root s3://mlflow/
+      --default-artifact-root s3://${MLFLOW_S3_BUCKET}/
       --host 0.0.0.0
       --port 5000
+    env_file: .env
     environment:
-      AWS_ACCESS_KEY_ID: minio
-      AWS_SECRET_ACCESS_KEY: minio123
+      # This URL uses the Docker network service name and internal port
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
     ports:
-      - "5000:5000"
+      - "${MLFLOW_PORT:-5000}:5000"
     depends_on:
       - minio
     volumes:
       - ../mlruns:/mlruns
-      - ../mlflow_data:/app  # optional: where mlflow.db will live
+      - ../mlflow_data:/app
 
   redis:
     image: redis:7
     container_name: redis
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
 
   trainer:
     build:
       context: ../services/trainer
       dockerfile: Dockerfile
     container_name: trainer
+    env_file: .env
     environment:
-      - MLFLOW_TRACKING_URI=http://mlflow:5000
-      - AWS_ACCESS_KEY_ID=minio
-      - AWS_SECRET_ACCESS_KEY=minio123
-      - MLFLOW_S3_ENDPOINT_URL=http://minio:9000
-      - ARTIFACTS_DIR=/app_artifacts
+      # These URLs are for service-to-service communication inside the Docker network
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+      # Mount point for artifacts inside the container
+      ARTIFACTS_DIR: /app_artifacts
     volumes:
       - ../artifacts:/app_artifacts
     command: ["python", "train.py"]
@@ -58,27 +56,68 @@ services:
       - mlflow
       - minio
 
-
   model-server:
     build:
-      context: ../services/model_server    # <<-- NOTE: context is relative to infra/
+      context: ../services/model_server
       dockerfile: Dockerfile
     container_name: model-server
-    command: uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+    command: ["uvicorn", "services.model_server.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     ports:
-      - "8000:8000"
+      - "${MODEL_SERVER_PORT:-8000}:8000" 
     depends_on:
       - mlflow
       - redis
+      - minio
+    env_file: .env
     environment:
+      # Service-to-service communication URLs
       MLFLOW_TRACKING_URI: http://mlflow:5000
-      AWS_ACCESS_KEY_ID: minio
-      AWS_SECRET_ACCESS_KEY: minio123
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
-      MODEL_NAME: ModelOpsStudioModel
     volumes:
-      - ../artifacts:/app/artifacts
-      - ../services/model_server:/app  # mount code so edits reflect without rebuild (dev convenience)
+      - ../:/app:delegated            # mount repo root into container so 'services' is available
+      - ../artifacts:/app/artifacts   # keep artifacts mount (optional)
+
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on:
+      - model-server
+
+  grafana:
+    image: grafana/grafana:10.4.1
+    container_name: grafana
+    env_file: .env
+    ports:
+      - "${GRAFANA_PORT:-3000}:3000"
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+  
+  frontend-dev:
+    build:
+      context: ../web
+      dockerfile: Dockerfile.dev
+    container_name: frontend-dev
+    ports:
+      - "${FRONTEND_DEV_PORT:-5173}:5173"
+    env_file: .env
+    volumes:
+      - ../web:/app           # mount code for hot reload
+      - /app/node_modules    # keep container node_modules (avoid host overwriting)
+    depends_on:
+      - model-server
+
 
 volumes:
   minio_data:
+  mlruns:
+  mlflow_data:
+  artifacts:

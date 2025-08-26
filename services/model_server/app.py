@@ -2,16 +2,24 @@
 import os
 import logging
 import threading
+import uuid
 from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import BaseModel
 import numpy as np
 import mlflow
 from mlflow.tracking import MlflowClient
-import mlflow.pyfunc
-from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from prometheus_client import (
+Counter,
+Histogram,
+Gauge,
+make_asgi_app,
+CONTENT_TYPE_LATEST,
+generate_latest,
+)
 from fastapi.middleware.cors import CORSMiddleware
+from services.model_server.model_loader import ModelLoader
 
 
 # -------------------------
@@ -20,8 +28,9 @@ from fastapi.middleware.cors import CORSMiddleware
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
 ARTIFACTS_PATH = os.getenv("ARTIFACTS_PATH", os.path.join(os.getcwd(), "artifacts"))
 DEFAULT_MODEL_NAME = os.getenv("MODEL_NAME", "ModelOpsStudioModel")
+EXPECTED_FEATURE_COUNT = int(os.getenv("EXPECTED_FEATURE_COUNT", "30"))
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("model-server")
 
 mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
@@ -30,9 +39,21 @@ client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
 # -------------------------
 # Prometheus metrics
 # -------------------------
-# We label metrics by model_run_id so we can compare per-version behavior in Grafana
-PRED_COUNTER = Counter("predictions_total", "Total predictions served", ["model_run_id"])
-LATENCY = Histogram("prediction_latency_seconds", "Prediction latency seconds", ["model_run_id"])
+def _short_run_label(run_id: Optional[str]) -> str:
+    if not run_id:
+        return "none"
+    return str(run_id)[:8]
+
+
+PRED_COUNTER = Counter("model_predictions_total", "Total predictions served", ["model"])
+PRED_ERRORS = Counter("model_prediction_errors_total", "Prediction errors", ["model", "type"])
+IN_FLIGHT = Gauge("model_predictions_in_flight", "Number of in-flight prediction requests", ["model"])
+LATENCY = Histogram(
+"model_prediction_latency_seconds",
+"Prediction latency seconds",
+["model"],
+buckets=(0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5, 10),
+)
 
 # -------------------------
 # FastAPI app & globals
@@ -46,10 +67,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_model_lock = threading.Lock()
-_current_model = None               # mlflow.pyfunc.PyFuncModel (or similar)
-_current_run_id: Optional[str] = None
+metrics_app = make_asgi_app()
+app.mount("/metrics", metrics_app)
 
+loader = ModelLoader(mlflow_client=client)
 
 # -------------------------
 # Pydantic request models
@@ -63,32 +84,6 @@ class PredictRequest(BaseModel):
 # -------------------------
 def _artifacts_latest_run_file() -> str:
     return os.path.join(ARTIFACTS_PATH, "latest_run_id.txt")
-
-
-def load_model_from_run(run_id: str) -> None:
-    """
-    Load model for the given run_id (sets global _current_model and _current_run_id).
-    Uses mlflow.pyfunc.load_model with runs:/ URI which will let MLflow + boto3 fetch artifacts from MinIO/S3.
-    """
-    global _current_model, _current_run_id
-
-    if not run_id:
-        raise ValueError("run_id must be provided")
-
-    model_uri_runs = f"runs:/{run_id}/model"
-    logger.info("Attempting to load model from %s (tracking URI %s)", model_uri_runs, MLFLOW_TRACKING_URI)
-
-    try:
-        model = mlflow.pyfunc.load_model(model_uri_runs)  # will use MLFLOW envs to access artifact store
-    except Exception as e:
-        logger.exception("Failed to load model from run %s: %s", run_id, e)
-        raise
-
-    with _model_lock:
-        _current_model = model
-        _current_run_id = run_id
-    logger.info("Successfully loaded model for run_id=%s (type=%s)", run_id, type(model))
-
 
 def resolve_initial_model() -> Optional[str]:
     """
@@ -147,11 +142,15 @@ def startup_load():
     try:
         run_id = resolve_initial_model()
         if run_id:
-            try:
-                load_model_from_run(run_id)
-                logger.info("Auto-loaded model from run %s on startup", run_id)
-            except Exception as e:
-                logger.warning("Auto-load failed for run %s: %s", run_id, e)
+            # load in background so server starts fast
+            def _bg_load(rid):
+                try:
+                    loader.load(rid)
+                    logger.info("Auto-loaded model from run %s on startup", rid)
+                except Exception as e:
+                    logger.warning("Auto-load failed for run %s: %s", rid, e)
+            t = threading.Thread(target=_bg_load, args=(run_id,), daemon=True)
+            t.start()
         else:
             logger.info("No initial model resolved at startup; start with no model loaded.")
     except Exception as e:
@@ -159,13 +158,38 @@ def startup_load():
 
 
 # -------------------------
+# Middleware: simple request id and logging
+# -------------------------
+@app.middleware("http")
+async def add_request_id_and_log(request: Request, call_next):
+    rid = request.headers.get("X-Request-Id", str(uuid.uuid4()))
+    request.state.request_id = rid
+    logger.info("req_start %s %s %s", rid, request.method, request.url.path)
+    try:
+        resp = await call_next(request)
+        logger.info("req_end %s %s %s %s", rid, request.method, request.url.path, resp.status_code)
+        resp.headers["X-Request-Id"] = rid
+        return resp
+    except Exception:
+        logger.exception("req_err %s %s %s", rid, request.method, request.url.path)
+        raise
+
+
+# -------------------------
 # API endpoints
 # -------------------------
+@app.get("/live")
+def liveness():
+    return {"status": "alive"}
+
+@app.get("/ready")
+def readiness():
+    return {"status": "ready" if loader.loaded() else "not_ready"}
+
 @app.get("/health")
 def health():
     """Simple health check."""
-    return {"status": "ok", "model_loaded": bool(_current_run_id)}
-
+    return {"status": "ok", "model_loaded": bool(loader.current_run_id())}
 
 @app.get("/runs")
 def list_runs(limit: int = Query(50, ge=1, le=200)) -> List[Dict[str, Any]]:
@@ -174,24 +198,24 @@ def list_runs(limit: int = Query(50, ge=1, le=200)) -> List[Dict[str, Any]]:
     Robustly iterates experiments and collects up to `limit` runs.
     """
     try:
-        # List experiments and ensure we pass a list to search_runs (some MLflow servers don't accept None)
         experiments = client.search_experiments()
         if not experiments:
             logger.warning("No experiments found in MLflow.")
             return []
 
+
         exp_ids = [exp.experiment_id for exp in experiments]
         logger.info("Found experiments: %s", exp_ids)
 
+
         collected_runs = []
-        # Iterate experiments and collect runs (ordered by start_time desc inside each experiment)
         for exp_id in exp_ids:
             try:
                 runs_for_exp = client.search_runs(
-                    experiment_ids=[exp_id],
-                    filter_string="",
-                    max_results=limit,
-                    order_by=["attributes.start_time DESC"]
+                experiment_ids=[exp_id],
+                filter_string="",
+                max_results=limit,
+                order_by=["attributes.start_time DESC"],
                 )
             except Exception as e:
                 logger.warning("search_runs failed for experiment %s: %s", exp_id, e)
@@ -207,23 +231,26 @@ def list_runs(limit: int = Query(50, ge=1, le=200)) -> List[Dict[str, Any]]:
             if len(collected_runs) >= limit:
                 break
 
-        # Format response
+
         out = []
         for r in collected_runs:
             info = r.info
             data = r.data
-            out.append({
-                "run_id": info.run_id,
-                "experiment_id": info.experiment_id,
-                "start_time": info.start_time,
-                "end_time": info.end_time,
-                "status": info.status,
-                "metrics": getattr(data, "metrics", {}) or {},
-                "params": getattr(data, "params", {}) or {},
-                "tags": getattr(data, "tags", {}) or {},
-                "artifact_uri": info.artifact_uri
-            })
+            out.append(
+            {
+            "run_id": info.run_id,
+            "experiment_id": info.experiment_id,
+            "start_time": info.start_time,
+            "end_time": info.end_time,
+            "status": info.status,
+            "metrics": getattr(data, "metrics", {}) or {},
+            "params": getattr(data, "params", {}) or {},
+            "tags": getattr(data, "tags", {}) or {},
+            "artifact_uri": info.artifact_uri,
+            }
+            )
         return out
+
 
     except Exception as e:
         logger.exception("Failed to list runs (top-level): %s", e)
@@ -240,11 +267,11 @@ def deploy_model(run_id: Optional[str] = None):
         raise HTTPException(status_code=400, detail="run_id is required to deploy a model")
 
     try:
-        load_model_from_run(run_id)
+        loader.load(run_id)
     except Exception as e:
+        logger.exception("Failed to load model %s: %s", run_id, e)
         raise HTTPException(status_code=500, detail=f"Failed to load model from run {run_id}: {e}")
 
-    # write the chosen run_id to artifacts/latest_run_id.txt for persistence
     try:
         os.makedirs(ARTIFACTS_PATH, exist_ok=True)
         with open(_artifacts_latest_run_file(), "w") as fh:
@@ -259,68 +286,106 @@ def deploy_model(run_id: Optional[str] = None):
 def predict(payload: PredictRequest):
     """
     Predict endpoint using the currently loaded model.
-    Returns {'prediction': prob_or_value, 'label': label_if_classification, 'model_run_id': ...}
+    Always returns a JSON object. Never falls through returning None.
     """
-    global _current_model, _current_run_id
-    if _current_model is None:
+    if not loader.loaded():
+        logger.warning("Predict called but no model loaded")
         raise HTTPException(status_code=400, detail="No model deployed. Call /deploy with a run_id first.")
 
-    # build input array
+    # Validate and build features array
     try:
         features = np.array(payload.features).reshape(1, -1)
     except Exception as e:
+        run_label = _short_run_label(loader.current_run_id())
+        PRED_ERRORS.labels(run_label, "validation").inc()
+        logger.debug("Invalid features payload: %s", e)
         raise HTTPException(status_code=400, detail=f"Invalid features format: {e}")
 
-    run_label = _current_run_id or "none"
+    run_label = _short_run_label(loader.current_run_id())
 
-    # instrument metrics per run_id label
+    # Validate length
+    if features.shape[1] != EXPECTED_FEATURE_COUNT:
+        PRED_ERRORS.labels(run_label, "validation").inc()
+        logger.info("Feature length mismatch: expected %d got %d", EXPECTED_FEATURE_COUNT, features.shape[1])
+        raise HTTPException(status_code=400, detail=f"expected {EXPECTED_FEATURE_COUNT} features, got {features.shape[1]}")
+
+    IN_FLIGHT.labels(run_label).inc()
+    response = None
     try:
-        timer = LATENCY.labels(run_label).time()
-        timer.__enter__()  # manual context manager entry
-        try:
-            # prefer predict_proba if available (probability for class 1)
-            if hasattr(_current_model, "predict_proba"):
-                proba = _current_model.predict_proba(features)[0]
-                # If binary classification, proba shape [p0, p1]
-                if proba.shape and len(proba) > 1:
-                    prob_value = float(proba[1])
+        with LATENCY.labels(run_label).time():
+            # delegate to loader.predict which may raise RuntimeError if no model
+            try:
+                result = loader.predict(features)
+            except RuntimeError as e:
+                PRED_ERRORS.labels(run_label, "exception").inc()
+                logger.exception("Loader predict runtime error: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+            # Normalize result into a response dict
+            try:
+                # If result is array-like (np.ndarray or list)
+                arr = np.array(result)
+                if arr.ndim == 2 and arr.shape[1] >= 2:
+                    prob_value = float(arr[0, 1])
+                    label = None
+                    try:
+                        # best-effort: attempt to get label if model supports predict()
+                        if hasattr(loader._model, "predict"):
+                            label = int(loader._model.predict(features)[0])
+                    except Exception:
+                        label = None
+                    response = {"prediction": prob_value, "label": label, "model_run_id": loader.current_run_id()}
                 else:
-                    prob_value = float(proba[0])
-                label = int(_current_model.predict(features)[0]) if hasattr(_current_model, "predict") else None
-                PRED_COUNTER.labels(run_label).inc()
-                return {"prediction": prob_value, "label": label, "model_run_id": run_label}
-            else:
-                # fallback to predict() output
-                pred = _current_model.predict(features)
-                val = float(pred[0]) if hasattr(pred, "__len__") else float(pred)
-                PRED_COUNTER.labels(run_label).inc()
-                return {"prediction": val, "model_run_id": run_label}
-        finally:
-            timer.__exit__(None, None, None)
-    except Exception as e:
-        logger.exception("Prediction failed for run %s: %s", run_label, e)
-        raise HTTPException(status_code=500, detail=str(e))
+                    # scalar fallback
+                    val = float(arr.flatten()[0])
+                    response = {"prediction": val, "model_run_id": loader.current_run_id()}
+            except Exception as e:
+                PRED_ERRORS.labels(run_label, "postprocess").inc()
+                logger.exception("Error postprocessing prediction result: %s", e)
+                raise HTTPException(status_code=500, detail="postprocessing failure")
+
+            # increment success counter
+            PRED_COUNTER.labels(run_label).inc()
+
+    finally:
+        IN_FLIGHT.labels(run_label).dec()
+
+    # Log and return the deterministic response
+    logger.info("Prediction returned for run=%s: %s", loader.current_run_id(), response)
+    return response
+
     
 @app.post("/probe_predict")
 def probe_predict(payload: PredictRequest):
-    if _current_model is None:
+    if not loader.loaded():
         raise HTTPException(status_code=400, detail="No model deployed")
     features = np.array(payload.features).reshape(1, -1)
-    # Try to return full arrays for debugging
     resp = {}
-    if hasattr(_current_model, "predict_proba"):
-        resp["predict_proba"] = _current_model.predict_proba(features).tolist()
-    if hasattr(_current_model, "predict"):
-        resp["predict"] = _current_model.predict(features).tolist()
-    if hasattr(_current_model, "decision_function"):
-        try:
-            resp["decision_function"] = _current_model.decision_function(features).tolist()
-        except Exception:
-            resp["decision_function"] = "n/a"
-    return {"model_run_id": _current_run_id, "debug": resp}
+    try:
+        if hasattr(loader._model, "predict_proba"):
+            resp["predict_proba"] = loader._model.predict_proba(features).tolist()
+    except Exception:
+        resp["predict_proba"] = "error"
+    try:
+        if hasattr(loader._model, "predict"):
+            resp["predict"] = loader._model.predict(features).tolist()
+    except Exception:
+        resp["predict"] = "error"
+    try:
+        if hasattr(loader._model, "decision_function"):
+            resp["decision_function"] = loader._model.decision_function(features).tolist()
+    except Exception:
+        resp["decision_function"] = "n/a"
+        return {"model_run_id": loader.current_run_id(), "debug": resp}
 
-
-@app.get("/metrics")
-def metrics():
-    """Prometheus metrics endpoint"""
+@app.get("/metrics_text")
+def metrics_text():
+    # Keep /metrics mounted for Prometheus ASGI app; provide a text export endpoint if needed
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+@app.on_event("shutdown")
+def shutdown_event():
+    try:
+        loader.unload()
+    except Exception:
+        logger.exception("Error unloading model on shutdown")

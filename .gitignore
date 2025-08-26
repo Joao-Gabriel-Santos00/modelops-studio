@@ -3,6 +3,13 @@ venv/
 minio_data/
 mlartifacts/
 mlruns/
+artifacts/
 __pycache__/
 tmp_model/
-web/
+web/node_modules/
+web/dist/
+web/.vite/
+infra/logs/
+*.log
+.pytest_cache/
+.coverage
