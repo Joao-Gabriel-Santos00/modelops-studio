@@ -5,12 +5,12 @@ RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/
 WORKDIR /app
 
 # copy requirements from build context (services/model_server)
-COPY requirements.txt /app/requirements.txt
+COPY requirements.txt .
 RUN pip install --upgrade pip
-RUN pip install -r /app/requirements.txt
+RUN pip install -r requirements.txt
 
 # copy app code (docker-compose mounts repo over /app during development)
-COPY . /app
+COPY ./services/model_server/ .
 
 EXPOSE 8000
 

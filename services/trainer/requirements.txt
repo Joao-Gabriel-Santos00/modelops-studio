@@ -1,9 +1,0 @@
-fastapi
-uvicorn[standard]
-mlflow
-scikit-learn
-numpy
-pandas
-prometheus_client
-redis
-boto3

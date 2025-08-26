@@ -6,11 +6,11 @@ RUN apt-get update && apt-get install -y build-essential && rm -rf /var/lib/apt/
 WORKDIR /app
 
 # Copy requirements first (better caching)
-COPY ../../requirements.txt requirements.txt
+COPY requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 # Copy trainer code
-COPY . .
+COPY ./services/trainer/ .
 
 # Default command (can be overridden in docker-compose)
 CMD ["python", "train.py"]

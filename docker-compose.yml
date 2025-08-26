@@ -9,6 +9,33 @@ services:
       - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
       - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  mc-setup:
+    image: minio/mc:latest
+    container_name: mc-setup
+    env_file: .env
+    # We must pass the variables the script needs
+    environment:
+      - MINIO_ROOT_USER=${MINIO_ROOT_USER}
+      - MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+      - MLFLOW_S3_BUCKET=${MLFLOW_S3_BUCKET}
+    depends_on:
+      minio:
+        condition: service_healthy # Waits for the MinIO healthcheck to pass
+    entrypoint: /bin/sh
+    command: -c "
+      echo 'Waiting for MinIO...' &&
+      sleep 5 &&
+      mc alias set myminio http://minio:9000 $$MINIO_ROOT_USER $$MINIO_ROOT_PASSWORD &&
+      echo 'Alias set. Checking for bucket...' &&
+      mc ls myminio/${MLFLOW_S3_BUCKET} > /dev/null 2>&1 || mc mb myminio/${MLFLOW_S3_BUCKET} &&
+      echo 'Bucket setup complete.'
+      "
 
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.9.2
@@ -26,10 +53,11 @@ services:
     ports:
       - "${MLFLOW_PORT:-5000}:5000"
     depends_on:
-      - minio
+      mc-setup:
+        condition: service_completed_successfully
     volumes:
-      - ../mlruns:/mlruns
-      - ../mlflow_data:/app
+      - ./mlruns:/mlruns
+      - ./mlflow_data:/app
 
   redis:
     image: redis:7
@@ -39,8 +67,8 @@ services:
 
   trainer:
     build:
-      context: ../services/trainer
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./services/trainer/Dockerfile
     container_name: trainer
     env_file: .env
     environment:
@@ -50,16 +78,18 @@ services:
       # Mount point for artifacts inside the container
       ARTIFACTS_DIR: /app_artifacts
     volumes:
-      - ../artifacts:/app_artifacts
+      - ./artifacts:/app_artifacts
     command: ["python", "train.py"]
     depends_on:
-      - mlflow
-      - minio
+      mc-setup:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_started
 
   model-server:
     build:
-      context: ../services/model_server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: ./services/model_server/Dockerfile
     container_name: model-server
     command: ["uvicorn", "services.model_server.app:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     ports:
@@ -74,8 +104,8 @@ services:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       MLFLOW_S3_ENDPOINT_URL: http://minio:9000
     volumes:
-      - ../:/app:delegated            # mount repo root into container so 'services' is available
-      - ../artifacts:/app/artifacts   # keep artifacts mount (optional)
+      - ./:/app:delegated            # mount repo root into container so 'services' is available
+      - ./artifacts:/app/artifacts   # keep artifacts mount (optional)
 
 
   prometheus:
@@ -84,36 +114,36 @@ services:
     ports:
       - "${PROMETHEUS_PORT:-9090}:9090"
     volumes:
-      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
     depends_on:
       - model-server
 
   grafana:
-    image: grafana/grafana:10.4.1
+    image: grafana/grafana:latest
     container_name: grafana
     env_file: .env
     ports:
       - "${GRAFANA_PORT:-3000}:3000"
     volumes:
-      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
-      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - ./infra/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infra/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
     depends_on:
       - prometheus
   
   frontend-dev:
     build:
-      context: ../web
+      context: ./web
       dockerfile: Dockerfile.dev
     container_name: frontend-dev
     ports:
       - "${FRONTEND_DEV_PORT:-5173}:5173"
     env_file: .env
     volumes:
-      - ../web:/app           # mount code for hot reload
+      - ./web:/app           # mount code for hot reload
       - /app/node_modules    # keep container node_modules (avoid host overwriting)
     depends_on:
-      - model-server
+      - model-server 
 
 
 volumes:
