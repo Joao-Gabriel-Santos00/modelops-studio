@@ -145,6 +145,19 @@ services:
     depends_on:
       - model-server 
 
+  k6:
+    image: grafana/k6:latest
+    container_name: k6
+    profiles: ["tools"]
+    networks:
+      - default
+    command: ["run", "/scripts/load_test.js"]
+    env_file: .env
+    environment:
+      - TARGET_HOST=http://model-server:8000
+    volumes:
+      - ./tools:/scripts:ro
+
 
 volumes:
   minio_data:
