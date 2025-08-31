@@ -1,8 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-COMPOSE_FILE=${COMPOSE_FILE:-infra/docker-compose.yml}
-HEALTH_URL=${HEALTH_URL:-http://localhost:8000/health}
+COMPOSE_FILE=${COMPOSE_FILE:-docker-compose.yml}
+# Source environment variables from the .env file if it exists
+if [ -f .env ]; then
+  export $(grep -v '^#' .env | xargs)
+fi
+
+# Use the variable from .env, with a fallback default
+HEALTH_URL=${MODEL_SERVER_HEALTH_URL:-http://localhost:8000/health}
 WAIT_TIMEOUT=${WAIT_TIMEOUT:-240}     # seconds to wait for health (increase if your machine is slow)
 SLEEP_SEC=${SLEEP_SEC:-2}
 LOG_DIR=infra/logs
